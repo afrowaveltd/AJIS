@@ -87,7 +87,13 @@ typedef struct TestFilter {
     int dump;
     int show_errors;      /* --errors: show pretty error reports for expected failures */
 
-    int run_all;          /* --all: traverse test_data */
+    /* suite selection */
+    int run_suites;       /* run selected suites recursively */
+    int include_common;   /* include ../test_data/common */
+    int include_lexer;    /* include ../test_data/lexer */
+
+    int run_custom;       /* --custom: append ../test_data/custom/{valid,invalid} */
+
     int only_valid;       /* --valid */
     int only_invalid;     /* --invalid */
 
@@ -152,20 +158,19 @@ static int run_one_file(const char* path, int dump, int show_errors, TestStats* 
     char* src = NULL;
     size_t src_len = 0;
     if (!read_file_all(path, &src, &src_len)) {
-    fprintf(stderr, "[TEST] Failed to read input (open/read error): %s\n", path);
-    if (st) st->failed++;
-    free(src);
-    return 0;
-}
+        fprintf(stderr, "[TEST] Failed to read input (open/read error): %s\n", path);
+        if (st) st->failed++;
+        free(src);
+        return 0;
+    }
 
-if (src_len == 0) {
-    /* Placeholder file – treat as SKIP (not a failure). */
-    if (st) st->skipped++;
-    printf("[SKIP] %s (empty file)\n", path);
-    free(src);
-    return 1; /* skip counts as non-failure */
-}
-
+    if (src_len == 0) {
+        /* Placeholder file – treat as SKIP (not a failure). */
+        if (st) st->skipped++;
+        printf("[SKIP] %s (empty file)\n", path);
+        free(src);
+        return 1; /* skip counts as non-failure */
+    }
 
     ajis_input in;
     ajis_input_init(&in, src, src_len);
@@ -213,7 +218,7 @@ if (src_len == 0) {
     if (ok) {
         if (st) st->passed++;
         printf("[PASS] %s%s\n", path, expect_fail ? " (expected fail)" : "");
-        
+
         /* If --errors is enabled and this was an expected failure, show the error */
         if (show_errors && expect_fail && saw_error) {
             printf("\n");
@@ -223,7 +228,7 @@ if (src_len == 0) {
     } else {
         if (st) st->failed++;
         printf("[FAIL] %s%s\n", path, expect_fail ? " (expected fail)" : "");
-        
+
         /* For unexpected failures, always show the error */
         if (saw_error) {
             printf("\n");
@@ -268,9 +273,6 @@ static void run_tree_recursive(const char* dir, const TestFilter* f, TestStats* 
         const char* name = ent->d_name;
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
 
-        /* Skip parser_invalid directory - these are parser-level errors, not lexer errors */
-        if (strcmp(name, "parser_invalid") == 0) continue;
-
         char path[1024];
         join_path(path, sizeof(path), dir, name);
 
@@ -291,6 +293,14 @@ static void run_tree_recursive(const char* dir, const TestFilter* f, TestStats* 
     closedir(d);
 }
 
+static void run_suite_dir(const char* dir, const TestFilter* f, TestStats* st) {
+    if (!is_directory(dir)) {
+        fprintf(stderr, "[TEST] Suite dir not found (skipping): %s\n", dir);
+        return;
+    }
+    run_tree_recursive(dir, f, st);
+}
+
 /* ---------------- CLI ---------------- */
 
 static void usage(const char* exe) {
@@ -298,9 +308,15 @@ static void usage(const char* exe) {
         "AJIS lexer tests\n\n"
         "Usage:\n"
         "  %s [path] [options]\n"
-        "  %s --all [options]\n\n"
-        "Options:\n"
-        "  --all              Run all .ajis files under tests/test_data (recursive)\n"
+        "  %s --full [options]\n"
+        "  %s --lexer [--common] [options]\n\n"
+        "Suites:\n"
+        "  --full             Run common + lexer suites (recursive)\n"
+        "  --lexer            Run lexer suite only (recursive)\n"
+        "  --common           Include common suite (used with --lexer)\n"
+        "  --no-common        Exclude common suite (default)\n"
+        "  --custom           Append custom tests from ../test_data/custom/{valid,invalid}\n\n"
+        "Filters:\n"
         "  --valid            Only valid tests\n"
         "  --invalid          Only invalid tests\n"
         "  --numbers          Only numbers category\n"
@@ -308,17 +324,26 @@ static void usage(const char* exe) {
         "  --arrays           Only arrays category\n"
         "  --objects          Only objects category\n"
         "  --complex          Only complex category\n"
-        "  --canonical        Only canonical category\n"
+        "  --canonical        Only canonical category\n\n"
+        "Output:\n"
         "  --dump             Dump tokens + errors\n"
         "  --errors           Show pretty error reports for expected failures\n"
         "  -h, --help         Show help\n\n"
         "Examples:\n"
-        "  %s tests/test_data/valid/numbers/n_basic_valid.ajis\n"
-        "  %s --all\n"
-        "  %s --all --numbers\n"
-        "  %s --all --numbers --invalid\n"
-        "  %s --all --complex --valid\n",
-        exe, exe, exe, exe, exe, exe, exe, exe);
+        "  %s\n"
+        "  %s ../test_data/lexer/valid/numbers/n_basic_valid.ajis\n"
+        "  %s --lexer\n"
+        "  %s --full --numbers\n"
+        "  %s --full --invalid --errors\n"
+        "  %s --full --custom\n",
+        exe, exe, exe,
+        exe,
+        exe,
+        exe,
+        exe,
+        exe,
+        exe,
+        exe);
 }
 
 static int parse_args(int argc, char** argv, TestFilter* f) {
@@ -329,7 +354,27 @@ static int parse_args(int argc, char** argv, TestFilter* f) {
 
         if (strcmp(a, "--dump") == 0) f->dump = 1;
         else if (strcmp(a, "--errors") == 0) f->show_errors = 1;
-        else if (strcmp(a, "--all") == 0) f->run_all = 1;
+
+        else if (strcmp(a, "--full") == 0) {
+            f->run_suites = 1;
+            f->include_common = 1;
+            f->include_lexer = 1;
+        }
+        else if (strcmp(a, "--lexer") == 0) {
+            f->run_suites = 1;
+            f->include_lexer = 1;
+        }
+        else if (strcmp(a, "--common") == 0) {
+            f->run_suites = 1;
+            f->include_common = 1;
+        }
+        else if (strcmp(a, "--no-common") == 0) {
+            f->include_common = 0;
+        }
+        else if (strcmp(a, "--custom") == 0) {
+            f->run_custom = 1;
+        }
+
         else if (strcmp(a, "--valid") == 0) f->only_valid = 1;
         else if (strcmp(a, "--invalid") == 0) f->only_invalid = 1;
 
@@ -341,7 +386,6 @@ static int parse_args(int argc, char** argv, TestFilter* f) {
         else if (strcmp(a, "--canonical") == 0) f->f_canonical = 1;
 
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) return 0;
-
         else {
             /* treat as path (single file) */
             f->single_path = a;
@@ -354,13 +398,18 @@ static int parse_args(int argc, char** argv, TestFilter* f) {
         return 0;
     }
 
-    /* If a path is provided, we don't need --all */
+    /* If a path is provided, prefer single-file mode. */
     return 1;
 }
 
 int main(int argc, char** argv) {
-    const char* default_path = "tests/test_data/valid/numbers/n_basic_valid.ajis";
-    const char* root_dir     = "tests/test_data";
+    const char* default_path = "../test_data/lexer/valid/numbers/n_basic_valid.ajis";
+
+    const char* dir_common = "../test_data/common";
+    const char* dir_lexer  = "../test_data/lexer";
+
+    const char* dir_custom_valid   = "../test_data/custom/valid";
+    const char* dir_custom_invalid = "../test_data/custom/invalid";
 
     TestFilter f;
     if (!parse_args(argc, argv, &f)) {
@@ -370,30 +419,50 @@ int main(int argc, char** argv) {
 
     TestStats st = {0};
 
-    if (f.run_all) {
-        printf("[TEST] Mode: ALL (recursive)\n");
-        printf("[TEST] Root: %s\n", root_dir);
-        if (f.only_valid) printf("[TEST] Filter: valid only\n");
-        if (f.only_invalid) printf("[TEST] Filter: invalid only\n");
-        if (any_category_selected(&f)) {
-            printf("[TEST] Category filter enabled\n");
-        }
-        if (f.dump) printf("[TEST] Dump: ON\n");
-
-        run_tree_recursive(root_dir, &f, &st);
-
-    } else {
-        const char* path = f.single_path ? f.single_path : default_path;
+    /* If user provided a single path, run only that (quick debug mode). */
+    if (f.single_path) {
         printf("[TEST] Mode: SINGLE\n");
-        printf("[TEST] File: %s\n", path);
+        printf("[TEST] File: %s\n", f.single_path);
         if (f.dump) printf("[TEST] Dump: ON\n");
 
-        run_one_file(path, f.dump, f.show_errors, &st);
+        run_one_file(f.single_path, f.dump, f.show_errors, &st);
+
+        printf("\n[SUMMARY] total=%d passed=%d failed=%d skipped=%d\n",
+            st.total, st.passed, st.failed, st.skipped);
+
+        return (st.failed == 0) ? 0 : 1;
     }
 
-   printf("\n[SUMMARY] total=%d passed=%d failed=%d skipped=%d\n",
-       st.total, st.passed, st.failed, st.skipped);
+    /* Default behavior (no suite flags): run a quick subset. */
+    if (!f.run_suites) {
+        printf("[TEST] Mode: QUICK\n");
+        printf("[TEST] Dir:  %s/valid\n", dir_lexer);
+        run_suite_dir("../test_data/lexer/valid", &f, &st);
+    } else {
+        printf("[TEST] Mode: SUITES (recursive)\n");
+        if (f.include_lexer)  printf("[TEST] Suite: lexer\n");
+        if (f.include_common) printf("[TEST] Suite: common\n");
+        if (f.only_valid) printf("[TEST] Filter: valid only\n");
+        if (f.only_invalid) printf("[TEST] Filter: invalid only\n");
+        if (any_category_selected(&f)) printf("[TEST] Category filter: ON\n");
+        if (f.dump) printf("[TEST] Dump: ON\n");
 
-return (st.failed == 0) ? 0 : 1;
+        if (f.include_common) run_suite_dir(dir_common, &f, &st);
+        if (f.include_lexer)  run_suite_dir(dir_lexer,  &f, &st);
+    }
 
+    if (f.run_custom) {
+        printf("\n");
+        printf("------------------------------------------------------------\n");
+        printf("CUSTOM TESTS (not part of official suite)\n");
+        printf("------------------------------------------------------------\n");
+
+        run_suite_dir(dir_custom_valid, &f, &st);
+        run_suite_dir(dir_custom_invalid, &f, &st);
+    }
+
+    printf("\n[SUMMARY] total=%d passed=%d failed=%d skipped=%d\n",
+        st.total, st.passed, st.failed, st.skipped);
+
+    return (st.failed == 0) ? 0 : 1;
 }
